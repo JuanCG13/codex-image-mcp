@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 HERE = Path(__file__).resolve().parent
@@ -280,6 +281,140 @@ class EditTest(Base):
             with self.subTest(kwargs=kwargs), self.assertRaisesRegex(core.CodexImageError, message):
                 self.edit(**kwargs)
         self.assertEqual(self.calls(), [])
+
+
+HEAD, TORSO, PICK, LAMP = (220, 180, 140), (90, 60, 40), (150, 150, 170), (255, 220, 60)
+
+
+def figure(scale=1, pose="stand", tint=0, pad=(3, 4), gradient=False):
+    """A 24x30 figure: a 12x10 head (with a 2x2 lamp) over a 24x20 torso, drawn at `scale`.
+
+    pose "pick" adds a 1px-wide pick raised 16 px above the head, clear of it;
+    pose "crouch" squashes the torso to 40x12, keeping its area."""
+    pick, crouch = pose == "pick", pose == "crouch"
+    torso_w, torso_h = (40, 12) if crouch else (24, 20)
+    top = 16 if pick else 0
+    w, h = torso_w, top + 10 + torso_h
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    shift = lambda c: tuple(max(0, min(255, v + tint)) for v in c) + (255,)
+    hx = (torso_w - 12) // 2
+    for x in range(hx, hx + 12):
+        for y in range(top, top + 10):
+            img.putpixel((x, y), shift(HEAD))
+    for x in range(hx + 8, hx + 10):
+        for y in range(top + 2, top + 4):
+            img.putpixel((x, y), shift(LAMP))
+    for x in range(torso_w):
+        for y in range(top + 10, h):
+            c = (TORSO[0] + (x % 8) * 3, TORSO[1] + (y % 5) * 3, TORSO[2]) if gradient else TORSO
+            img.putpixel((x, y), shift(c))
+    if pick:
+        for x in range(hx + 15, hx + 16):
+            for y in range(0, top + 16):
+                img.putpixel((x, y), shift(PICK))
+    img = img.resize((w * scale, h * scale), Image.Resampling.NEAREST)
+    out = Image.new("RGBA", (img.width + 2 * pad[0], img.height + 2 * pad[1]), (0, 0, 0, 0))
+    out.paste(img, pad)
+    return out
+
+
+def opaque_box(img, colour_test):
+    a = np.asarray(img)
+    ys, xs = np.nonzero((a[..., 3] == 255) & colour_test(a))
+    return xs.min(), ys.min(), xs.max(), ys.max()
+
+
+is_head = lambda a: (a[..., 0] > 180) & (a[..., 1] > 140) & (a[..., 1] < 200) & (a[..., 2] > 100)
+is_torso = lambda a: (a[..., 0] < 130) & (a[..., 1] < 100)
+
+
+class NormalizeTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.ref = self.root / "ref.png"
+        figure(1, "pick", pad=(10, 2), gradient=True).save(self.ref)
+        self.frames = []
+        for name, img in [("small.png", figure(4, tint=6, pad=(30, 20), gradient=True)),
+                          ("big_pick.png", figure(6, "pick", tint=-5, pad=(7, 50), gradient=True)),
+                          ("crouch.png", figure(5, "crouch", tint=3, pad=(90, 5), gradient=True))]:
+            path = self.root / name
+            img.save(path)
+            self.frames.append(str(path))
+        self.out = self.root / "out"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_norm(self, **kw):
+        return core.normalize_frames(self.frames, str(self.ref), str(self.out), **kw)
+
+    def test_frames_share_canvas_and_feet_baseline(self):
+        result = self.run_norm()
+        images = [Image.open(r["path"]) for r in result["frames"]]
+        self.assertEqual(len({im.size for im in images}), 1)
+        self.assertEqual(list(result["canvas"]), list(images[0].size))
+        bottoms = {opaque_box(im, is_torso)[3] for im in images}
+        self.assertEqual(bottoms, {result["anchor"][1] - 1})
+
+    def test_every_pose_keeps_the_reference_head_size(self):
+        """A raised pick or a crouch must not rescale the character: the head stays 12x10."""
+        result = self.run_norm()
+        for r in result["frames"]:
+            x0, y0, x1, y1 = opaque_box(Image.open(r["path"]), is_head)
+            with self.subTest(frame=Path(r["source"]).name):
+                self.assertAlmostEqual(x1 - x0 + 1, 12, delta=1)
+                self.assertAlmostEqual(y1 - y0 + 1, 10, delta=1)
+
+    def test_standing_frames_share_the_horizontal_anchor(self):
+        result = self.run_norm()
+        small, pick = (Image.open(r["path"]) for r in result["frames"][:2])
+        self.assertEqual(opaque_box(small, is_torso)[0], opaque_box(pick, is_torso)[0])
+
+    def test_colours_snap_to_the_reference_palette_and_alpha_is_hard(self):
+        result = self.run_norm()
+        ref_colours = {c[:3] for _, c in Image.open(self.ref).getcolors() if c[3]}
+        for r in result["frames"]:
+            img = Image.open(r["path"])
+            self.assertLessEqual({c[3] for _, c in img.getcolors(100000)}, {0, 255})
+            self.assertLessEqual({c[:3] for _, c in img.getcolors(100000) if c[3]}, ref_colours)
+
+    def test_a_small_palette_still_keeps_rare_bright_colours(self):
+        result = self.run_norm(palette_size=6)
+        colours = {c[:3] for _, c in Image.open(result["frames"][0]["path"]).getcolors(100000) if c[3]}
+        self.assertTrue(any(r > 200 and g > 180 and b < 120 for r, g, b in colours), colours)
+
+    def test_a_painted_feature_of_one_pixel_shades_survives(self):
+        """Painted art spreads a lamp over many shades of one pixel each; it must not be noise."""
+        rng = np.random.default_rng(0)
+        art = np.zeros((200, 200, 4), dtype=np.uint8)
+        art[20:200, 40:160, :3] = (np.array(TORSO) + rng.integers(0, 30, (180, 120, 3))).clip(0, 255)
+        art[20:200, 40:160, 3] = 255
+        for i in range(25):
+            art[30 + i // 5, 100 + i % 5] = (250 - i % 3, 220 - i // 3, 60 + i, 255)
+        ref = self.root / "painted.png"
+        Image.fromarray(art, "RGBA").save(ref)
+        result = core.normalize_frames([str(ref)], str(ref), str(self.root / "p"), palette_size=8)
+        colours = {c[:3] for _, c in Image.open(result["frames"][0]["path"]).getcolors(100000) if c[3]}
+        self.assertTrue(any(r > 200 and g > 180 and b < 120 for r, g, b in colours), colours)
+
+    def test_palette_can_be_disabled(self):
+        result = self.run_norm(palette_size=0)
+        img = Image.open(result["frames"][0]["path"])
+        colours = {c[:3] for _, c in img.getcolors(100000) if c[3]}
+        self.assertIn(tuple(v + 6 for v in TORSO), colours)
+
+    def test_refuses_to_overwrite_and_rejects_opaque_frames(self):
+        self.run_norm()
+        with self.assertRaisesRegex(core.CodexImageError, "already exists"):
+            self.run_norm()
+        self.run_norm(overwrite=True)
+        opaque = self.root / "opaque.png"
+        Image.new("RGBA", (20, 20), (9, 9, 9, 255)).save(opaque)
+        with self.assertRaisesRegex(core.CodexImageError, "transparent"):
+            core.normalize_frames([str(opaque)], str(self.ref), str(self.root / "o2"))
+        with self.assertRaisesRegex(core.CodexImageError, "frame"):
+            core.normalize_frames([], str(self.ref), str(self.root / "o3"))
 
 
 class LoginTest(unittest.TestCase):

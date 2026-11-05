@@ -51,6 +51,7 @@ Any other MCP client (stdio):
 | `generate_image` | One image to `output_path` (`.png`). Accepts `reference_images` to follow a character design or palette. |
 | `generate_images` | Several jobs in parallel (`concurrency`, default 3), for example every pose of a sprite set. One result per job, in order. |
 | `edit_image` | Changes only a region (`box` or `mask_path`) of an existing image. Everything outside it stays pixel-identical. |
+| `normalize_frames` | Makes generated frames one consistent set: same body size, feet baseline and palette as a reference. Local and instant. |
 | `login_status` | Whether Codex is signed in, and the plan (`plus`, `pro`...). |
 | `start_device_login` | Starts `codex login --device-auth` and returns the URL and one-time code. |
 
@@ -103,6 +104,28 @@ you wanted kept drift (proportions, colours, details). `edit_image` makes edits 
 
 The result includes `alignment` (`scale`: generated px per original px, `origin`, `error`: the
 mean RGB difference outside the region) and a `warning` when the result matched poorly.
+
+### Making frames a consistent set
+
+Each generation is independent, so frames of one animation come back at different sizes and
+positions, with slightly different colours. `normalize_frames` fixes that deterministically:
+
+- **Scale:** every frame is resized so the character's body area matches the reference's. Area,
+  unlike height, barely changes when the character crouches, leans or lunges. Thin parts such
+  as a pick handle (under ~4% of the figure's size) are left out of the measure.
+- **Anchor:** frames are placed on one shared canvas with the same feet baseline and the same
+  centre, taken from the feet rows. The result reports that `anchor` point for the sprite offset.
+- **Palette:** colours snap to up to `palette_size` (default 32) of the reference's own colours.
+  They are picked farthest-first from the most common colour, so a small lamp glow or eye
+  highlight wins a place over many near-identical shades. `0` keeps the generated colours. Alpha becomes fully opaque or transparent.
+
+```json
+{
+  "frame_paths": ["/abs/gen/windup.png", "/abs/gen/strike.png"],
+  "reference_path": "/abs/path/assets/miner_idle.png",
+  "output_dir": "/abs/path/assets/miner_combat"
+}
+```
 
 ## Cost and speed
 

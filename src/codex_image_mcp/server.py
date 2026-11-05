@@ -73,6 +73,28 @@ def edit_image(image_path: str, prompt: str, output_path: str, mask_path: str | 
         return {"error": str(e)}
 
 
+@mcp.tool()
+def normalize_frames(frame_paths: list[str], reference_path: str, output_dir: str,
+                     palette_size: int = 32, padding: int = 2,
+                     overwrite: bool = False) -> dict:
+    """Turn separately generated frames into one consistent sprite set (no Codex call, instant).
+
+    Frames need a transparent background (generate them with chroma_key). Each frame is
+    scaled so the character's body area (ignoring thin parts like a pick handle) matches
+    reference_path, which keeps the same size whether the pose stands, crouches or lunges.
+    Frames are anchored on a shared feet baseline and centre on one canvas, given hard alpha,
+    and snapped to up to palette_size of the reference's own colours (0 keeps the generated
+    colours).
+    Writes <output_dir>/<frame name>.png and returns each frame's scale and body height,
+    the shared canvas size and the anchor (feet point) for the engine's sprite offset.
+    """
+    try:
+        return core.normalize_frames(frame_paths, reference_path, output_dir,
+                                     palette_size, padding, overwrite)
+    except core.CodexImageError as e:
+        return {"error": str(e)}
+
+
 generate_image.__doc__ += POSTPROCESS_DOC
 generate_images.__doc__ += POSTPROCESS_DOC
 

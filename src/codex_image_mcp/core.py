@@ -398,6 +398,163 @@ def edit(
     return report
 
 
+BODY_ROW_SHARE = 0.4  # rows thinner than this share of the median row are props (a raised pick)
+FEET_SHARE = 0.2      # bottom share of the body used to find the horizontal anchor
+MASS_SIDE = 128       # the figure's longest side when measuring its body mass
+MASS_OPENING = 2      # px at MASS_SIDE: parts thinner than ~4% of the figure (a pick handle) are ignored
+
+
+def _body_metrics(alpha: np.ndarray) -> tuple[int, int, int]:
+    """(top, bottom, centre_x) of a figure from its opacity mask.
+
+    top skips thin rows above the body, such as a weapon held overhead; bottom is the
+    lowest opaque row (the feet); centre_x is the median column of the feet rows."""
+    counts = alpha.sum(axis=1)
+    rows = np.nonzero(counts)[0]
+    threshold = BODY_ROW_SHARE * float(np.median(counts[rows]))
+    top, bottom = int(np.nonzero(counts >= threshold)[0][0]), int(rows[-1])
+    feet = max(1, round(FEET_SHARE * (bottom - top + 1)))
+    xs = np.nonzero(alpha[bottom - feet + 1:bottom + 1])[1]
+    return top, bottom, int(math.floor(float(np.median(xs)) + 0.5))
+
+
+def _shift_all(mask: np.ndarray, combine) -> np.ndarray:
+    padded = np.pad(mask, 1, constant_values=False)
+    h, w = mask.shape
+    out = mask.copy()
+    for dy in (0, 1, 2):
+        for dx in (0, 1, 2):
+            out = combine(out, padded[dy:dy + h, dx:dx + w])
+    return out
+
+
+def _body_mass(alpha: np.ndarray) -> float:
+    """Opaque area of the figure, in its own pixels, without thin parts such as a pick handle.
+
+    Unlike height, the area barely changes when the character crouches, leans or lunges,
+    so it gives the same scale for every pose."""
+    ys, xs = np.nonzero(alpha)
+    crop = alpha[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+    r = MASS_SIDE / max(crop.shape)
+    size = (max(1, round(crop.shape[1] * r)), max(1, round(crop.shape[0] * r)))
+    mask = np.asarray(Image.fromarray(crop.astype(np.uint8) * 255).resize(size, Image.Resampling.BOX)) >= 128
+    for _ in range(MASS_OPENING):
+        mask = _shift_all(mask, np.logical_and)
+    for _ in range(MASS_OPENING):
+        mask = _shift_all(mask, np.logical_or)
+    return float(mask.sum()) / (r * r)
+
+
+PALETTE_MIN_SHARE = 0.0001  # colour buckets rarer than this share of the opaque pixels are noise
+PALETTE_BUCKET = 3          # bits dropped per channel when grouping painted shades
+
+
+def _palette(img: Image.Image, size: int) -> np.ndarray:
+    """Up to `size` of the reference's own opaque colours.
+
+    Painted art spreads one feature (a lamp's glow) over many one-pixel shades, so shades are
+    first grouped into buckets of near-identical colour, each represented by its most common
+    real shade; buckets rarer than PALETTE_MIN_SHARE are specks of noise. Then greedy max-min
+    selection starts from the most common bucket and keeps adding the one farthest from every
+    colour chosen so far, so small but distinct colours win a place over many similar shades."""
+    a = np.asarray(img)
+    pixels = a[a[..., 3] >= 128][:, :3]
+    colours, counts = np.unique(pixels, axis=0, return_counts=True)
+    if len(colours) <= size:
+        return colours.astype(np.float32)
+    buckets = colours >> PALETTE_BUCKET
+    keys = (buckets[:, 0].astype(np.int64) << 16) | (buckets[:, 1].astype(np.int64) << 8) | buckets[:, 2]
+    order = np.lexsort((-counts, keys))
+    keys, colours, counts = keys[order], colours[order], counts[order]
+    starts = np.r_[0, np.nonzero(np.diff(keys))[0] + 1]
+    totals = np.add.reduceat(counts, starts)
+    keep = totals >= max(1, PALETTE_MIN_SHARE * len(pixels))
+    colours, totals = colours[starts][keep].astype(np.float32), totals[keep]
+    chosen = [int(totals.argmax())]
+    dist = ((colours - colours[chosen[0]]) ** 2).sum(axis=1)
+    while len(chosen) < min(size, len(colours)):
+        nxt = int(dist.argmax())
+        chosen.append(nxt)
+        dist = np.minimum(dist, ((colours - colours[nxt]) ** 2).sum(axis=1))
+    return colours[chosen]
+
+
+def normalize_frames(
+    frame_paths: list[str],
+    reference_path: str,
+    output_dir: str,
+    palette_size: int = 32,
+    padding: int = 2,
+    overwrite: bool = False,
+) -> dict:
+    """Make generated frames a consistent sprite set.
+
+    Every frame is scaled so the character's body mass (its area without thin parts such as a
+    pick handle) matches the reference's, which holds across poses. Frames are anchored on a
+    shared feet baseline and horizontal centre on one canvas, given hard alpha, and snapped to
+    the reference palette (palette_size=0 skips)."""
+    if not frame_paths:
+        raise CodexImageError("pass at least one frame")
+    ref_path = Path(reference_path).expanduser().resolve()
+    if not ref_path.is_file():
+        raise CodexImageError(f"reference image not found: {ref_path}")
+    out_dir = Path(output_dir).expanduser().resolve()
+    sources = [Path(f).expanduser().resolve() for f in frame_paths]
+    targets = [out_dir / (src.stem + ".png") for src in sources]
+    for src, dst in zip(sources, targets):
+        if not src.is_file():
+            raise CodexImageError(f"frame not found: {src}")
+        if dst.exists() and not overwrite:
+            raise CodexImageError(f"{dst} already exists; pass overwrite=true to replace it")
+    if len(set(targets)) != len(targets):
+        raise CodexImageError("frames must have distinct file names")
+
+    with Image.open(ref_path) as im:
+        reference = im.convert("RGBA")
+    ref_mass = _body_mass(np.asarray(reference)[..., 3] >= 128)
+    palette = _palette(reference, palette_size) if palette_size else None
+
+    scaled = []
+    for src in sources:
+        with Image.open(src) as im:
+            frame = im.convert("RGBA")
+        alpha = np.asarray(frame)[..., 3] >= 128
+        if alpha.all() or not alpha.any():
+            raise CodexImageError(f"{src.name} has no transparent background; "
+                                  "generate it with chroma_key first")
+        scale = math.sqrt(ref_mass / _body_mass(alpha))
+        crop = frame.crop(Image.fromarray(alpha).getbbox())
+        size = (max(1, round(crop.width * scale)), max(1, round(crop.height * scale)))
+        a = np.asarray(crop.convert("RGBa").resize(size, Image.Resampling.BOX).convert("RGBA")).copy()
+        opaque = a[..., 3] >= 128
+        a[..., 3] = np.where(opaque, 255, 0)
+        a[~opaque, :3] = 0
+        if palette is not None:
+            px = a[opaque][:, :3].astype(np.float32)
+            nearest = ((px[:, None, :] - palette[None, :, :]) ** 2).sum(axis=2).argmin(axis=1)
+            a[opaque, :3] = palette[nearest].astype(np.uint8)
+        top, bottom, cx = _body_metrics(opaque)
+        scaled.append((a, top, bottom, cx, scale))
+
+    left = max(cx for _, _, _, cx, _ in scaled)
+    right = max(a.shape[1] - cx for a, _, _, cx, _ in scaled)
+    up = max(bottom + 1 for _, _, bottom, _, _ in scaled)
+    down = max(a.shape[0] - bottom - 1 for a, _, bottom, _, _ in scaled)
+    canvas = (left + right + 2 * padding, up + down + 2 * padding)
+    anchor = (padding + left, padding + up)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    frames = []
+    for src, dst, (a, top, bottom, cx, scale) in zip(sources, targets, scaled):
+        img = Image.new("RGBA", canvas, (0, 0, 0, 0))
+        img.paste(Image.fromarray(a, "RGBA"), (anchor[0] - cx, anchor[1] - bottom - 1))
+        img.save(dst)
+        frames.append({"path": str(dst), "source": str(src), "scale": round(float(scale), 4),
+                       "body_height": bottom - top + 1})
+    return {"frames": frames, "canvas": list(canvas), "anchor": list(anchor),
+            "palette_colors": 0 if palette is None else len(palette)}
+
+
 def generate_batch(jobs: list[dict], concurrency: int = 3, **shared) -> list[dict]:
     """Run several generate() jobs in parallel. Each job is a dict of generate() arguments;
     `shared` arguments apply to every job unless the job overrides them.
