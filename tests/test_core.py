@@ -163,6 +163,125 @@ class BatchTest(Base):
         self.assertEqual((r["width"], r["height"]), (8, 8))
 
 
+SKIN, GREEN, BODY = (220, 180, 140, 255), (0, 200, 0, 255), (128, 128, 128, 255)
+HEAD_BOX = [6, 0, 14, 6]
+
+
+class EditTest(Base):
+    """A 20x16 sprite on a transparent background: a grey body and a skin-coloured head.
+    The fake Codex returns it flattened on magenta, upscaled 8x, shifted by (5, 11) px on a
+    bigger canvas, with the head turned green and the body slightly lighter."""
+
+    def setUp(self):
+        super().setUp()
+        self.sprite = self.sprite_image()
+        self.original = self.root / "miner.png"
+        self.sprite.save(self.original)
+        os.environ["FAKE_IMAGE"] = str(self.fake_result())
+
+    def tearDown(self):
+        os.environ.pop("FAKE_IMAGE", None)
+        super().tearDown()
+
+    def sprite_image(self, background=(0, 0, 0, 0)):
+        img = Image.new("RGBA", (20, 16), background)
+        for x in range(4, 16):
+            for y in range(6, 16):
+                img.putpixel((x, y), BODY)
+        for x in range(7, 13):
+            for y in range(1, 6):
+                img.putpixel((x, y), SKIN)
+        return img
+
+    def fake_result(self):
+        flat = Image.new("RGBA", self.sprite.size, (255, 0, 255, 255))
+        flat.alpha_composite(self.sprite)
+        px = flat.load()
+        for x in range(20):
+            for y in range(16):
+                if px[x, y] == SKIN:
+                    px[x, y] = GREEN
+                elif px[x, y] == BODY:
+                    px[x, y] = (140, 140, 140, 255)
+        px[6, 3] = (200, 60, 200, 255)  # anti-aliased fringe blended with the magenta background
+        canvas = Image.new("RGB", (176, 144), (255, 0, 255))
+        canvas.paste(flat.convert("RGB").resize((160, 128), Image.Resampling.NEAREST), (5, 11))
+        path = self.root / "fake_result.png"
+        canvas.save(path)
+        return path
+
+    def edit(self, out=None, **kw):
+        out = out or self.root / "edited.png"
+        return core.edit(str(self.original), "make the head green", str(out),
+                         codex_bin=FAKE, codex_home=str(self.home), **kw), out
+
+    def test_box_edit_changes_only_the_box_and_keeps_the_rest_pixel_identical(self):
+        result, out = self.edit(box=HEAD_BOX)
+        edited = Image.open(out)
+        self.assertEqual(edited.size, (20, 16))
+        x0, y0, x1, y1 = HEAD_BOX
+        for x in range(20):
+            for y in range(16):
+                if not (x0 <= x < x1 and y0 <= y < y1):
+                    self.assertEqual(edited.getpixel((x, y)), self.sprite.getpixel((x, y)), (x, y))
+        self.assertEqual(edited.getpixel((9, 3)), GREEN)
+        self.assertEqual(edited.getpixel((6, 0))[3], 0)  # background inside the box stays transparent
+        self.assertAlmostEqual(result["alignment"]["scale"], 8, delta=0.5)
+        self.assertLess(result["alignment"]["error"], 20)
+        json.dumps(result)  # plain JSON types, so the MCP layer can serialise it
+
+    def test_removes_the_background_tint_from_new_edges_inside_the_region(self):
+        _, out = self.edit(box=HEAD_BOX)
+        r, g, b, a = Image.open(out).getpixel((6, 3))
+        self.assertEqual(a, 255)
+        self.assertLess(max(r, b) - g, 15)
+
+    def test_mask_image_selects_its_white_pixels(self):
+        mask = Image.new("L", (20, 16), 0)
+        x0, y0, x1, y1 = HEAD_BOX
+        mask.paste(255, (x0, y0, x1, y1))
+        mask_path = self.root / "mask.png"
+        mask.save(mask_path)
+        _, out = self.edit(mask_path=str(mask_path))
+        edited = Image.open(out)
+        self.assertEqual(edited.getpixel((9, 3)), GREEN)
+        self.assertEqual(edited.getpixel((9, 10)), BODY)
+
+    def test_opaque_original_keeps_the_generated_background_inside_the_mask(self):
+        self.sprite = self.sprite_image(background=(255, 0, 255, 255))
+        self.sprite.save(self.original)
+        _, out = self.edit(box=HEAD_BOX)
+        self.assertEqual(Image.open(out).getpixel((6, 0)), (255, 0, 255, 255))
+
+    def test_sends_the_original_and_the_mask_as_references(self):
+        self.edit(box=HEAD_BOX)
+        [call] = self.calls()
+        self.assertEqual(call["argv"].count("-i"), 2)
+        self.assertIn("make the head green", call["stdin"])
+        self.assertIn("mask", call["stdin"].lower())
+
+    def test_refuses_to_overwrite_unless_asked(self):
+        out = self.root / "edited.png"
+        out.write_bytes(b"old")
+        with self.assertRaisesRegex(core.CodexImageError, "already exists"):
+            self.edit(out, box=HEAD_BOX)
+        self.edit(out, box=HEAD_BOX, overwrite=True)
+        self.assertEqual(Image.open(out).getpixel((9, 3)), GREEN)
+
+    def test_invalid_regions_fail_before_running(self):
+        bad_mask = self.root / "small_mask.png"
+        Image.new("L", (10, 10), 255).save(bad_mask)
+        cases = [({}, "mask_path or box"),
+                 ({"box": HEAD_BOX, "mask_path": str(bad_mask)}, "mask_path or box"),
+                 ({"mask_path": str(bad_mask)}, "size"),
+                 ({"box": [0, 0, 30, 5]}, "box"),
+                 ({"box": [0, 0, 20, 16]}, "whole image")]
+        for kwargs, message in cases:
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(core.CodexImageError, message):
+                self.edit(**kwargs)
+        self.assertEqual(self.calls(), [])
+
+
 class LoginTest(unittest.TestCase):
     def test_status_reads_plan_from_id_token(self):
         with tempfile.TemporaryDirectory() as home:

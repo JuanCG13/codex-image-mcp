@@ -49,6 +49,30 @@ def generate_images(jobs: list[dict], concurrency: int = 3, chroma_key: str | No
                                reasoning_effort=reasoning_effort)
 
 
+@mcp.tool()
+def edit_image(image_path: str, prompt: str, output_path: str, mask_path: str | None = None,
+               box: list[int] | None = None, overwrite: bool = False, background: str = "#FF00FF",
+               tolerance: int = 60, reasoning_effort: str = "low",
+               timeout_seconds: int = 600) -> dict:
+    """Edit only one region of an image; every pixel outside it stays identical to the original.
+
+    Pass exactly one region:
+    - box: [x0, y0, x1, y1] in the image's pixels (x1, y1 exclusive).
+    - mask_path: a PNG the same size as the image; white (or opaque white) pixels may change.
+    Codex redraws the picture from the original and the mask (~30-60 s, plan usage limits);
+    the result is aligned back onto the original and only the region's pixels are taken.
+    background: flat colour a transparent original is shown on; inside the region that
+    colour is keyed back to transparency (tolerance = RGB distance).
+    The result reports alignment (scale, origin, error) and a warning when the match is poor;
+    the full generated image stays at raw_path.
+    """
+    try:
+        return core.edit(image_path, prompt, output_path, mask_path, box, overwrite, background,
+                         tolerance, timeout_seconds, reasoning_effort)
+    except core.CodexImageError as e:
+        return {"error": str(e)}
+
+
 generate_image.__doc__ += POSTPROCESS_DOC
 generate_images.__doc__ += POSTPROCESS_DOC
 

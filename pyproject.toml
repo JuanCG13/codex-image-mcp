@@ -5,7 +5,7 @@ description = "MCP server that generates images (sprites, concept art) with your
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
-dependencies = ["mcp>=1.2,<2", "pillow>=10"]
+dependencies = ["mcp>=1.2,<2", "numpy>=1.24", "pillow>=10"]
 keywords = ["mcp", "codex", "chatgpt", "image-generation", "sprites", "gamedev"]
 
 [project.scripts]

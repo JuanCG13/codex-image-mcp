@@ -2,7 +2,7 @@
 """Stand-in for the codex CLI: records its call and mimics `exec` and `login`.
 
 `exec` writes a 48x32 PNG: flat magenta (#FF00FF) with a grey 8x8 square whose
-top-left corner is at x=10, y=12.
+top-left corner is at x=10, y=12, or the bytes of $FAKE_IMAGE when it is set.
 """
 import json
 import os
@@ -57,7 +57,8 @@ if mode == "ok":
     d = os.path.join(os.environ["CODEX_HOME"], "generated_images", tid)
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, "exec-a.png"), "wb") as f:
-        f.write(png(48, 32))
+        fixed = os.environ.get("FAKE_IMAGE")
+        f.write(open(fixed, "rb").read() if fixed else png(48, 32))
     print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "DONE"}}))
 else:
     print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "I can't call the image tool here."}}))

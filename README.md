@@ -50,6 +50,7 @@ Any other MCP client (stdio):
 | --- | --- |
 | `generate_image` | One image to `output_path` (`.png`). Accepts `reference_images` to follow a character design or palette. |
 | `generate_images` | Several jobs in parallel (`concurrency`, default 3), for example every pose of a sprite set. One result per job, in order. |
+| `edit_image` | Changes only a region (`box` or `mask_path`) of an existing image. Everything outside it stays pixel-identical. |
 | `login_status` | Whether Codex is signed in, and the plan (`plus`, `pro`...). |
 | `start_device_login` | Starts `codex login --device-auth` and returns the URL and one-time code. |
 
@@ -77,6 +78,31 @@ The untouched original stays at `raw_path` in the result. Each result also repor
   "max_size": 96
 }
 ```
+
+### Editing a region
+
+Codex's built-in image tool has no mask: every edit redraws the whole picture, so the parts
+you wanted kept drift (proportions, colours, details). `edit_image` makes edits safe:
+
+1. It sends Codex the original (upscaled when small, transparent areas shown on `background`)
+   and a black-and-white mask of the region, and asks for that change only.
+2. It searches the scale and offset that best overlay the result on the original outside the
+   region, so a re-framed or resized result still lines up.
+3. It copies only the region's pixels from the result. Outside the region the output is the
+   original, byte for byte, alpha included. Inside, the background colour is keyed back to
+   transparency when the original had any.
+
+```json
+{
+  "image_path": "/abs/path/assets/miner.png",
+  "prompt": "Give the miner a red helmet lamp",
+  "box": [20, 0, 60, 24],
+  "output_path": "/abs/path/assets/miner_lamp.png"
+}
+```
+
+The result includes `alignment` (`scale`: generated px per original px, `origin`, `error`: the
+mean RGB difference outside the region) and a `warning` when the result matched poorly.
 
 ## Cost and speed
 

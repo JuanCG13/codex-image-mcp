@@ -14,10 +14,12 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 DEFAULT_TIMEOUT = 600
@@ -117,34 +119,9 @@ def postprocess(path: Path, chroma_key: str | None = None, tolerance: int = DEFA
     img.save(path)
 
 
-def generate(
-    prompt: str,
-    output_path: str,
-    reference_images: list[str] | tuple[str, ...] = (),
-    overwrite: bool = False,
-    timeout: int = DEFAULT_TIMEOUT,
-    chroma_key: str | None = None,
-    tolerance: int = DEFAULT_TOLERANCE,
-    trim: bool = False,
-    max_size: int | None = None,
-    reasoning_effort: str = "low",
-    codex_bin: str | None = None,
-    codex_home: str | None = None,
-) -> dict:
-    out = Path(output_path).expanduser().resolve()
-    if out.suffix.lower() != ".png":
-        raise CodexImageError(f"output_path must end in .png: {out}")
-    if out.exists() and not overwrite:
-        raise CodexImageError(f"{out} already exists; pass overwrite=true to replace it")
-    refs = [Path(r).expanduser().resolve() for r in reference_images]
-    for ref in refs:
-        if not ref.is_file():
-            raise CodexImageError(f"reference image not found: {ref}")
-    if chroma_key:
-        parse_color(chroma_key)
-    if reasoning_effort not in REASONING_EFFORTS:
-        raise CodexImageError(f"reasoning_effort must be one of {REASONING_EFFORTS}")
-
+def _run_codex(text: str, refs: list[Path], timeout: int, reasoning_effort: str,
+               codex_bin: str | None, codex_home: str | None) -> tuple[list[Path], str, dict]:
+    """Run one headless Codex turn and return the images it saved, oldest first."""
     home = resolve_home(codex_home)
     cmd = [resolve_bin(codex_bin), "exec", "--skip-git-repo-check", "--ignore-rules",
            "--ignore-user-config", "-s", "read-only", "--json",
@@ -154,9 +131,6 @@ def generate(
     for ref in refs:
         cmd += ["-i", str(ref)]
     cmd.append("-")  # prompt on stdin, so -i cannot swallow it
-    ref_note = ("The attached image(s) are references; follow them for character design, "
-                "palette and style.\n") if refs else ""
-    text = PROMPT_TEMPLATE.format(refs=ref_note, prompt=prompt.strip())
 
     env = dict(os.environ, CODEX_HOME=str(home))
     with tempfile.TemporaryDirectory(prefix="codex-image-") as work:
@@ -191,6 +165,41 @@ def generate(
     if not images:
         detail = "; ".join(errors) or (replies[-1] if replies else run.stderr.strip()[-500:])
         raise CodexImageError(f"Codex finished without generating an image: {detail}")
+    return images, thread_id, usage
+
+
+def generate(
+    prompt: str,
+    output_path: str,
+    reference_images: list[str] | tuple[str, ...] = (),
+    overwrite: bool = False,
+    timeout: int = DEFAULT_TIMEOUT,
+    chroma_key: str | None = None,
+    tolerance: int = DEFAULT_TOLERANCE,
+    trim: bool = False,
+    max_size: int | None = None,
+    reasoning_effort: str = "low",
+    codex_bin: str | None = None,
+    codex_home: str | None = None,
+) -> dict:
+    out = Path(output_path).expanduser().resolve()
+    if out.suffix.lower() != ".png":
+        raise CodexImageError(f"output_path must end in .png: {out}")
+    if out.exists() and not overwrite:
+        raise CodexImageError(f"{out} already exists; pass overwrite=true to replace it")
+    refs = [Path(r).expanduser().resolve() for r in reference_images]
+    for ref in refs:
+        if not ref.is_file():
+            raise CodexImageError(f"reference image not found: {ref}")
+    if chroma_key:
+        parse_color(chroma_key)
+    if reasoning_effort not in REASONING_EFFORTS:
+        raise CodexImageError(f"reasoning_effort must be one of {REASONING_EFFORTS}")
+
+    ref_note = ("The attached image(s) are references; follow them for character design, "
+                "palette and style.\n") if refs else ""
+    text = PROMPT_TEMPLATE.format(refs=ref_note, prompt=prompt.strip())
+    images, thread_id, usage = _run_codex(text, refs, timeout, reasoning_effort, codex_bin, codex_home)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(images[-1], out)
@@ -200,6 +209,193 @@ def generate(
         width, height = img.size
     return {"path": str(out), "width": width, "height": height, "thread_id": thread_id,
             "raw_path": str(images[-1]), "images_generated": len(images), "usage": usage}
+
+
+EDIT_PROMPT = """Edit the first attached image with your built-in image generation tool and output exactly one image.
+The second attached image is a mask of the same picture: white marks the only area to change,
+black marks the areas that must stay exactly as they are.
+Keep the same framing, scale, position, pose, style and palette, and the flat {background} background.
+Redraw only what the edit needs inside the white area.
+Do not run shell commands, read files or write files.
+
+Edit request:
+{prompt}
+
+When the image is generated, reply only with DONE."""
+
+REFERENCE_MIN_SIDE = 512  # small sprites are upscaled (nearest) so the model sees them clearly
+ALIGN_SIDE = 48           # coarse alignment search grid, in px on the longest side
+REFINE_SIDE = 256         # fine alignment grid
+ALIGN_WARNING = 30        # mean RGB difference outside the mask that suggests a bad match
+
+
+def _edit_region(size: tuple[int, int], mask_path: str | None, box) -> np.ndarray:
+    """Boolean array (height x width), True where the edit may change pixels."""
+    if (mask_path is None) == (box is None):
+        raise CodexImageError("pass exactly one of mask_path or box")
+    w, h = size
+    if box is not None:
+        try:
+            x0, y0, x1, y1 = (int(v) for v in box)
+        except (TypeError, ValueError) as e:
+            raise CodexImageError(f"box must be [x0, y0, x1, y1], got {box!r}") from e
+        if not (0 <= x0 < x1 <= w and 0 <= y0 < y1 <= h):
+            raise CodexImageError(f"box {list(box)} must satisfy 0 <= x0 < x1 <= {w} and 0 <= y0 < y1 <= {h}")
+        region = np.zeros((h, w), dtype=bool)
+        region[y0:y1, x0:x1] = True
+    else:
+        path = Path(mask_path).expanduser().resolve()
+        if not path.is_file():
+            raise CodexImageError(f"mask not found: {path}")
+        with Image.open(path) as m:
+            mask = m.convert("RGBA")
+        if mask.size != size:
+            raise CodexImageError(f"mask size {mask.size} differs from image size {size}")
+        flat = Image.new("RGBA", mask.size, (0, 0, 0, 255))
+        flat.alpha_composite(mask)
+        region = np.asarray(flat.convert("L")) >= 128
+    if not region.any():
+        raise CodexImageError("the mask selects no pixels")
+    if region.all():
+        raise CodexImageError("the mask covers the whole image; use generate_image instead")
+    return region
+
+
+def _sample(gen: np.ndarray, f: float, dx: float, dy: float, xs: np.ndarray, ys: np.ndarray):
+    """Nearest-sample `gen` at original-image points (xs, ys), where original = gen * f + (dx, dy)."""
+    gh, gw = gen.shape[:2]
+    gx = np.floor((xs - dx) / f).astype(np.int64)
+    gy = np.floor((ys - dy) / f).astype(np.int64)
+    valid = ((gy >= 0) & (gy < gh))[:, None] & ((gx >= 0) & (gx < gw))[None, :]
+    return gen[np.clip(gy, 0, gh - 1)][:, np.clip(gx, 0, gw - 1)], valid
+
+
+def _align(gen: np.ndarray, orig: np.ndarray, keep: np.ndarray) -> tuple[float, float, float, float]:
+    """Find the scale and offset that best overlay `gen` on `orig` where `keep` is True.
+
+    Coarse-to-fine search; the cost is the mean RGB difference over the kept pixels, with
+    pixels falling outside the generated image counted as fully different.
+    Returns (f, dx, dy, error): original = generated * f + (dx, dy)."""
+    h, w = orig.shape[:2]
+    gh, gw = gen.shape[:2]
+
+    def grid(side):
+        r = min(1.0, side / max(w, h))
+        cw, ch = max(1, round(w * r)), max(1, round(h * r))
+        xs = (np.arange(cw) + 0.5) * w / cw
+        ys = (np.arange(ch) + 0.5) * h / ch
+        ix, iy = np.minimum(xs.astype(int), w - 1), np.minimum(ys.astype(int), h - 1)
+        return xs, ys, orig[iy][:, ix], keep[iy][:, ix], w / cw
+
+    def cost(f, dx, dy, xs, ys, target, kept):
+        sample, valid = _sample(gen, f, dx, dy, xs, ys)
+        diff = np.where(valid, np.abs(sample - target).mean(axis=2), 255.0)
+        return float(diff[kept].mean())
+
+    def search(scales, shifts_x, shifts_y, centred, g):
+        best = (math.inf, 0.0, 0.0, 0.0)
+        for f in scales:
+            cx, cy = ((w - gw * f) / 2, (h - gh * f) / 2) if centred else (0.0, 0.0)
+            for dy in shifts_y:
+                for dx in shifts_x:
+                    c = cost(f, cx + dx, cy + dy, *g[:4])
+                    if c < best[0]:
+                        best = (c, f, cx + dx, cy + dy)
+        return best
+
+    # Coarse: the model usually centres the picture, so search shifts around the centred fit.
+    lo, hi = min(w / gw, h / gh) * 0.85, max(w / gw, h / gh) * 1.15
+    scales = np.geomspace(lo, hi, max(2, math.ceil(math.log(hi / lo) / math.log(1.01)) + 1))
+    g = grid(ALIGN_SIDE)
+    step = g[4]
+    span_x, span_y = np.arange(-0.15 * w, 0.15 * w + step, step), np.arange(-0.15 * h, 0.15 * h + step, step)
+    _, f, dx, dy = search(scales, span_x, span_y, True, g)
+
+    # Fine: a narrow window around the coarse result, on a denser grid.
+    g = grid(REFINE_SIDE)
+    window = np.linspace(-step, step, 9)
+    err, f, dx, dy = search(f * np.linspace(0.98, 1.02, 9), dx + window, dy + window, False, g)
+    return f, dx, dy, err
+
+
+def edit(
+    image_path: str,
+    prompt: str,
+    output_path: str,
+    mask_path: str | None = None,
+    box: list[int] | tuple[int, int, int, int] | None = None,
+    overwrite: bool = False,
+    background: str = "#FF00FF",
+    tolerance: int = DEFAULT_TOLERANCE,
+    timeout: int = DEFAULT_TIMEOUT,
+    reasoning_effort: str = "low",
+    codex_bin: str | None = None,
+    codex_home: str | None = None,
+) -> dict:
+    """Edit only a region of an image; every pixel outside it stays identical to the original.
+
+    Codex redraws the whole picture from the original and a mask. The result is aligned
+    back onto the original, and only the pixels inside the region are taken from it."""
+    src = Path(image_path).expanduser().resolve()
+    if not src.is_file():
+        raise CodexImageError(f"image not found: {src}")
+    out = Path(output_path).expanduser().resolve()
+    if out.suffix.lower() != ".png":
+        raise CodexImageError(f"output_path must end in .png: {out}")
+    if out.exists() and not overwrite:
+        raise CodexImageError(f"{out} already exists; pass overwrite=true to replace it")
+    if reasoning_effort not in REASONING_EFFORTS:
+        raise CodexImageError(f"reasoning_effort must be one of {REASONING_EFFORTS}")
+    bg = parse_color(background)
+    with Image.open(src) as im:
+        original = im.convert("RGBA")
+    region = _edit_region(original.size, mask_path, box)
+
+    flat = Image.new("RGBA", original.size, bg + (255,))
+    flat.alpha_composite(original)
+    flat = flat.convert("RGB")
+    w, h = original.size
+    k = max(1, math.ceil(REFERENCE_MIN_SIDE / max(w, h)))
+    text = EDIT_PROMPT.format(background="#" + background.strip().lstrip("#").upper(),
+                              prompt=prompt.strip())
+    with tempfile.TemporaryDirectory(prefix="codex-image-edit-") as tmp:
+        ref, mask_ref = Path(tmp, "original.png"), Path(tmp, "mask.png")
+        flat.resize((w * k, h * k), Image.Resampling.NEAREST).save(ref)
+        Image.fromarray((region * 255).astype(np.uint8)).resize(
+            (w * k, h * k), Image.Resampling.NEAREST).save(mask_ref)
+        images, thread_id, usage = _run_codex(text, [ref, mask_ref], timeout, reasoning_effort,
+                                              codex_bin, codex_home)
+
+    with Image.open(images[-1]) as gi:
+        gen = np.asarray(gi.convert("RGB"), dtype=np.float32)
+    target = np.asarray(flat, dtype=np.float32)
+    f, dx, dy, err = _align(gen, target, ~region)
+
+    sample, valid = _sample(gen, f, dx, dy, np.arange(w) + 0.5, np.arange(h) + 0.5)
+    result = np.asarray(original).copy()
+    take = region & valid
+    result[take, :3] = sample[take].round().astype(np.uint8)
+    result[take, 3] = 255
+    if (result[..., 3] < 255).any() or (np.asarray(original)[..., 3] < 255).any():
+        # The original has a transparent background: key the background colour back out.
+        dist = np.sqrt(((sample - np.array(bg, dtype=np.float32)) ** 2).sum(axis=2))
+        result[take & (dist <= tolerance)] = 0
+        # Remove the background's tint from new anti-aliased edges, only inside the region.
+        despilled = Image.fromarray(result, "RGBA").copy()
+        _despill_edges(despilled, bg)
+        result[take] = np.asarray(despilled)[take]
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(result, "RGBA").save(out)
+    report = {"path": str(out), "width": w, "height": h, "thread_id": thread_id,
+              "raw_path": str(images[-1]), "pixels_changed": int(take.sum()), "usage": usage,
+              "alignment": {"scale": round(float(1 / f), 3),
+                            "origin": [round(float(-dx / f), 1), round(float(-dy / f), 1)],
+                            "error": round(float(err), 1)}}
+    if err > ALIGN_WARNING:
+        report["warning"] = (f"the generated image matched the original poorly outside the mask "
+                             f"(mean RGB difference {err:.0f}); check the result or retry")
+    return report
 
 
 def generate_batch(jobs: list[dict], concurrency: int = 3, **shared) -> list[dict]:
