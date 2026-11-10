@@ -46,6 +46,76 @@ def resolve_home(override: str | None = None) -> Path:
     return Path(override or os.environ.get("CODEX_HOME") or Path.home() / ".codex")
 
 
+def lean_home_path() -> Path:
+    return Path(os.environ.get("CODEX_IMAGE_LEAN_HOME")
+                or Path.home() / ".cache" / "codex-image-mcp" / "codex-home")
+
+
+_AUTH_LOCK = threading.Lock()
+
+
+class _auth_lock:
+    """Serialises auth syncing across threads and, where fcntl exists, across processes."""
+
+    def __init__(self, lean: Path):
+        self.path = lean / ".auth.lock"
+
+    def __enter__(self):
+        _AUTH_LOCK.acquire()
+        self.file = open(self.path, "a")
+        try:
+            import fcntl
+            fcntl.flock(self.file, fcntl.LOCK_EX)
+        except ImportError:
+            pass
+        return self
+
+    def __exit__(self, *exc):
+        self.file.close()  # closing releases the flock
+        _AUTH_LOCK.release()
+
+
+def _link_auth(lean: Path, real_auth: Path) -> None:
+    link = lean / "auth.json"
+    if link.is_symlink() and Path(os.readlink(link)) == real_auth:
+        return
+    tmp = lean / f".auth.{os.getpid()}.{threading.get_ident()}.link"
+    tmp.unlink(missing_ok=True)
+    tmp.symlink_to(real_auth)
+    os.replace(tmp, link)
+
+
+def _prepare_lean_home(real_home: Path) -> Path | None:
+    """A Codex home without the user's AGENTS.md, skills, memories or history: only the login,
+    shared by a symlink so a token refresh written in place lands in the real file.
+    Returns None when the login is not a plain auth.json (e.g. kept in the OS keyring)."""
+    real_auth = (real_home / "auth.json").resolve()
+    if not real_auth.is_file():
+        return None
+    lean = lean_home_path()
+    if lean.resolve() == real_home.resolve():
+        return None
+    lean.mkdir(parents=True, exist_ok=True)
+    with _auth_lock(lean):
+        _sync_auth_back(lean, real_auth)
+        _link_auth(lean, real_auth)
+    return lean
+
+
+def _sync_auth_back(lean: Path, real_auth: Path) -> None:
+    """If Codex replaced the symlink with a new file (an atomic refresh), the new tokens
+    only live in the lean home: copy them to the real login when newer, then relink."""
+    copy = lean / "auth.json"
+    if copy.is_symlink() or not copy.is_file():
+        return
+    if copy.read_bytes() != real_auth.read_bytes() and copy.stat().st_mtime >= real_auth.stat().st_mtime:
+        tmp = real_auth.with_name(f".auth.json.{os.getpid()}.tmp")
+        shutil.copyfile(copy, tmp)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, real_auth)
+    _link_auth(lean, real_auth)
+
+
 def resolve_bin(override: str | None = None) -> str:
     return override or os.environ.get("CODEX_BIN") or "codex"
 
@@ -120,9 +190,15 @@ def postprocess(path: Path, chroma_key: str | None = None, tolerance: int = DEFA
 
 
 def _run_codex(text: str, refs: list[Path], timeout: int, reasoning_effort: str,
-               codex_bin: str | None, codex_home: str | None) -> tuple[list[Path], str, dict]:
-    """Run one headless Codex turn and return the images it saved, oldest first."""
-    home = resolve_home(codex_home)
+               codex_bin: str | None, codex_home: str | None,
+               lean_context: bool = True) -> tuple[list[Path], str, dict]:
+    """Run one headless Codex turn and return the images it saved, oldest first.
+
+    With lean_context, Codex runs in a home of its own that shares only the login, so the
+    user's AGENTS.md, skills and memories never enter the prompt (about 19k fewer tokens)."""
+    real_home = resolve_home(codex_home)
+    lean = _prepare_lean_home(real_home) if lean_context else None
+    home = lean or real_home
     cmd = [resolve_bin(codex_bin), "exec", "--skip-git-repo-check", "--ignore-rules",
            "--ignore-user-config", "-s", "read-only", "--json",
            "-c", f'model_reasoning_effort="{reasoning_effort}"']
@@ -141,6 +217,10 @@ def _run_codex(text: str, refs: list[Path], timeout: int, reasoning_effort: str,
             raise CodexImageError(f"codex CLI not found ({cmd[0]}); install it or set CODEX_BIN") from e
         except subprocess.TimeoutExpired as e:
             raise CodexImageError(f"codex timed out after {timeout}s") from e
+        finally:
+            if lean:
+                with _auth_lock(lean):
+                    _sync_auth_back(lean, (real_home / "auth.json").resolve())
 
     thread_id, errors, replies, usage = None, [], [], {}
     for line in run.stdout.splitlines():
@@ -179,6 +259,7 @@ def generate(
     trim: bool = False,
     max_size: int | None = None,
     reasoning_effort: str = "low",
+    lean_context: bool = True,
     codex_bin: str | None = None,
     codex_home: str | None = None,
 ) -> dict:
@@ -199,7 +280,8 @@ def generate(
     ref_note = ("The attached image(s) are references; follow them for character design, "
                 "palette and style.\n") if refs else ""
     text = PROMPT_TEMPLATE.format(refs=ref_note, prompt=prompt.strip())
-    images, thread_id, usage = _run_codex(text, refs, timeout, reasoning_effort, codex_bin, codex_home)
+    images, thread_id, usage = _run_codex(text, refs, timeout, reasoning_effort, codex_bin, codex_home,
+                                          lean_context)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(images[-1], out)
@@ -329,6 +411,7 @@ def edit(
     tolerance: int = DEFAULT_TOLERANCE,
     timeout: int = DEFAULT_TIMEOUT,
     reasoning_effort: str = "low",
+    lean_context: bool = True,
     codex_bin: str | None = None,
     codex_home: str | None = None,
 ) -> dict:
@@ -364,7 +447,7 @@ def edit(
         Image.fromarray((region * 255).astype(np.uint8)).resize(
             (w * k, h * k), Image.Resampling.NEAREST).save(mask_ref)
         images, thread_id, usage = _run_codex(text, [ref, mask_ref], timeout, reasoning_effort,
-                                              codex_bin, codex_home)
+                                              codex_bin, codex_home, lean_context)
 
     with Image.open(images[-1]) as gi:
         gen = np.asarray(gi.convert("RGB"), dtype=np.float32)

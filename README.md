@@ -130,9 +130,16 @@ positions, with slightly different colours. `normalize_frames` fixes that determ
 ## Cost and speed
 
 - About 30–60 s per image. `generate_images` runs them in parallel.
-- Each run sends Codex's own context: its system prompt, your global `~/.codex/AGENTS.md` and the
-  skills list. Most of it is cached between runs. A large global `AGENTS.md` makes every image
-  more expensive.
+- Every tool runs Codex in a lean home of its own, `~/.cache/codex-image-mcp/codex-home`
+  (override with `CODEX_IMAGE_LEAN_HOME`). It shares only your login: `auth.json` is a symlink to
+  the real one, so your global `AGENTS.md`, skills, memories and history never reach the prompt.
+  Measured on one image with one reference: about 135k input tokens with the full home, 30k lean. Pass `lean_context: false` to use
+  your full Codex home instead.
+- If Codex refreshes the login by replacing `auth.json` instead of writing through the symlink,
+  the new tokens are copied back to the real file and the link is restored after the run. When
+  there is no `auth.json` (for example credentials kept in the OS keyring), the full home is used.
+- Reference images cost far more than the text: each one adds tens of thousands of input tokens.
+  Pass only the references the image needs.
 - The server runs Codex with `--ignore-user-config` and with apps, plugins, the browser and
   multi-agent turned off, so the request goes straight to the image tool and a model pinned in
   your config cannot break it.

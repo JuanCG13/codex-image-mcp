@@ -19,17 +19,20 @@ POSTPROCESS_DOC = """
 def generate_image(prompt: str, output_path: str, reference_images: list[str] | None = None,
                    overwrite: bool = False, chroma_key: str | None = None, tolerance: int = 60,
                    trim: bool = False, max_size: int | None = None,
-                   reasoning_effort: str = "low", timeout_seconds: int = 600) -> dict:
+                   reasoning_effort: str = "low", timeout_seconds: int = 600,
+                   lean_context: bool = True) -> dict:
     """Generate one image with Codex's built-in image tool on the signed-in ChatGPT plan.
 
     Takes ~30-60 s and counts against the plan's Codex usage limits.
     output_path: absolute path ending in .png; existing files are kept unless overwrite=true.
     reference_images: local image paths Codex should follow for design, palette or style.
     reasoning_effort: Codex effort before calling the tool ("low" is fastest).
+    lean_context: run Codex in its own home that shares only the login, without your
+    AGENTS.md, skills or memories (~19k fewer input tokens per run). false uses your full home.
     """
     try:
         return core.generate(prompt, output_path, reference_images or [], overwrite, timeout_seconds,
-                             chroma_key, tolerance, trim, max_size, reasoning_effort)
+                             chroma_key, tolerance, trim, max_size, reasoning_effort, lean_context)
     except core.CodexImageError as e:
         return {"error": str(e)}
 
@@ -37,7 +40,8 @@ def generate_image(prompt: str, output_path: str, reference_images: list[str] | 
 @mcp.tool()
 def generate_images(jobs: list[dict], concurrency: int = 3, chroma_key: str | None = None,
                     tolerance: int = 60, trim: bool = False, max_size: int | None = None,
-                    overwrite: bool = False, reasoning_effort: str = "low") -> list[dict]:
+                    overwrite: bool = False, reasoning_effort: str = "low",
+                    lean_context: bool = True) -> list[dict]:
     """Generate several images in parallel (e.g. every pose of a sprite set).
 
     jobs: list of {"prompt", "output_path", optional "reference_images" and any per-job override
@@ -46,14 +50,14 @@ def generate_images(jobs: list[dict], concurrency: int = 3, chroma_key: str | No
     """
     return core.generate_batch(jobs, concurrency, chroma_key=chroma_key, tolerance=tolerance,
                                trim=trim, max_size=max_size, overwrite=overwrite,
-                               reasoning_effort=reasoning_effort)
+                               reasoning_effort=reasoning_effort, lean_context=lean_context)
 
 
 @mcp.tool()
 def edit_image(image_path: str, prompt: str, output_path: str, mask_path: str | None = None,
                box: list[int] | None = None, overwrite: bool = False, background: str = "#FF00FF",
                tolerance: int = 60, reasoning_effort: str = "low",
-               timeout_seconds: int = 600) -> dict:
+               timeout_seconds: int = 600, lean_context: bool = True) -> dict:
     """Edit only one region of an image; every pixel outside it stays identical to the original.
 
     Pass exactly one region:
@@ -65,10 +69,12 @@ def edit_image(image_path: str, prompt: str, output_path: str, mask_path: str | 
     colour is keyed back to transparency (tolerance = RGB distance).
     The result reports alignment (scale, origin, error) and a warning when the match is poor;
     the full generated image stays at raw_path.
+    lean_context: run Codex in its own home that shares only the login, without your
+    AGENTS.md, skills or memories (~19k fewer input tokens per run). false uses your full home.
     """
     try:
         return core.edit(image_path, prompt, output_path, mask_path, box, overwrite, background,
-                         tolerance, timeout_seconds, reasoning_effort)
+                         tolerance, timeout_seconds, reasoning_effort, lean_context)
     except core.CodexImageError as e:
         return {"error": str(e)}
 

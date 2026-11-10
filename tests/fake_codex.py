@@ -47,8 +47,22 @@ stdin = sys.stdin.read()
 tid = "thread-" + uuid.uuid4().hex[:8]
 if log_dir:
     with open(os.path.join(log_dir, tid + ".json"), "w") as f:
-        json.dump({"argv": args, "stdin": stdin, "cwd": os.getcwd(), "start": time.time()}, f)
+        json.dump({"argv": args, "stdin": stdin, "cwd": os.getcwd(), "start": time.time(),
+                   "codex_home": os.environ.get("CODEX_HOME"),
+                   "auth": open(os.path.join(os.environ["CODEX_HOME"], "auth.json")).read()
+                   if os.path.exists(os.path.join(os.environ["CODEX_HOME"], "auth.json")) else None}, f)
 print(json.dumps({"type": "thread.started", "thread_id": tid}), flush=True)
+# FAKE_REFRESH mimics a token refresh: "inplace" rewrites auth.json through any symlink,
+# "rename" replaces it with a new file the way an atomic write does.
+refresh = os.environ.get("FAKE_REFRESH")
+auth_path = os.path.join(os.environ.get("CODEX_HOME", "."), "auth.json")
+if refresh == "inplace":
+    with open(auth_path, "w") as f:
+        f.write('{"tokens": "refreshed-inplace"}')
+elif refresh == "rename":
+    with open(auth_path + ".tmp", "w") as f:
+        f.write('{"tokens": "refreshed-rename"}')
+    os.replace(auth_path + ".tmp", auth_path)
 if mode == "fail":
     print(json.dumps({"type": "turn.failed", "error": {"message": "usage limit reached"}}))
     sys.exit(1)

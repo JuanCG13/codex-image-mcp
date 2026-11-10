@@ -417,6 +417,75 @@ class NormalizeTest(unittest.TestCase):
             core.normalize_frames([], str(self.ref), str(self.root / "o3"))
 
 
+class LeanHomeTest(Base):
+    """Codex runs in a lean home of its own, sharing only the login with the real one."""
+
+    def setUp(self):
+        super().setUp()
+        (self.home / "AGENTS.md").write_text("huge personal instructions")
+        self.auth = self.home / "auth.json"
+        self.auth.write_text('{"tokens": "original"}')
+        self.lean = self.root / "lean_home"
+        os.environ["CODEX_IMAGE_LEAN_HOME"] = str(self.lean)
+
+    def tearDown(self):
+        for key in ("CODEX_IMAGE_LEAN_HOME", "FAKE_REFRESH"):
+            os.environ.pop(key, None)
+        super().tearDown()
+
+    def test_runs_in_the_lean_home_with_the_real_login_and_without_agents_md(self):
+        result = self.gen(self.root / "o.png")
+        [call] = self.calls()
+        self.assertEqual(Path(call["codex_home"]).resolve(), self.lean.resolve())
+        self.assertEqual(call["auth"], '{"tokens": "original"}')
+        self.assertFalse((self.lean / "AGENTS.md").exists())
+        self.assertTrue((self.lean / "auth.json").is_symlink())
+        self.assertTrue(Path(result["raw_path"]).is_relative_to(self.lean.resolve()))
+
+    def test_a_refresh_written_in_place_reaches_the_real_login(self):
+        os.environ["FAKE_REFRESH"] = "inplace"
+        self.gen(self.root / "o.png")
+        self.assertEqual(self.auth.read_text(), '{"tokens": "refreshed-inplace"}')
+        self.assertFalse(self.auth.is_symlink())
+
+    def test_a_refresh_that_replaces_the_file_is_copied_back_and_relinked(self):
+        os.environ["FAKE_REFRESH"] = "rename"
+        self.gen(self.root / "o.png")
+        self.assertEqual(self.auth.read_text(), '{"tokens": "refreshed-rename"}')
+        self.assertEqual(self.auth.stat().st_mode & 0o777, 0o600)
+        self.assertTrue((self.lean / "auth.json").is_symlink())
+
+    def test_parallel_runs_share_the_lean_home_safely(self):
+        os.environ["FAKE_REFRESH"] = "rename"
+        jobs = [{"prompt": "coin", "output_path": str(self.root / f"c{i}.png")} for i in range(3)]
+        results = core.generate_batch(jobs, codex_bin=FAKE, codex_home=str(self.home))
+        self.assertTrue(all("error" not in r for r in results), results)
+        self.assertEqual(self.auth.read_text(), '{"tokens": "refreshed-rename"}')
+        self.assertTrue((self.lean / "auth.json").is_symlink())
+
+    def test_full_context_uses_the_real_home(self):
+        self.gen(self.root / "o.png", lean_context=False)
+        [call] = self.calls()
+        self.assertEqual(Path(call["codex_home"]).resolve(), self.home.resolve())
+
+    def test_without_an_auth_file_it_falls_back_to_the_real_home(self):
+        self.auth.unlink()  # e.g. credentials kept in the OS keyring
+        self.gen(self.root / "o.png")
+        [call] = self.calls()
+        self.assertEqual(Path(call["codex_home"]).resolve(), self.home.resolve())
+
+    def test_edit_also_runs_lean(self):
+        img = self.root / "s.png"
+        Image.new("RGBA", (20, 16), (0, 0, 0, 0)).save(img)
+        os.environ["FAKE_IMAGE"] = str(img)
+        try:
+            core.edit(str(img), "x", str(self.root / "e.png"), box=[0, 0, 5, 5],
+                      codex_bin=FAKE, codex_home=str(self.home))
+        finally:
+            os.environ.pop("FAKE_IMAGE")
+        self.assertEqual(Path(self.calls()[0]["codex_home"]).resolve(), self.lean.resolve())
+
+
 class LoginTest(unittest.TestCase):
     def test_status_reads_plan_from_id_token(self):
         with tempfile.TemporaryDirectory() as home:
