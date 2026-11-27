@@ -12,7 +12,7 @@ from PIL import Image
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "src"))
 
-from codex_image_mcp import core  # noqa: E402
+from codex_image_mcp import accounts, core  # noqa: E402
 
 FAKE = str(HERE / "fake_codex.py")
 
@@ -25,13 +25,16 @@ class Base(unittest.TestCase):
         self.home.mkdir()
         self.logs = self.root / "logs"
         self.logs.mkdir()
-        os.environ.update(FAKE_LOG_DIR=str(self.logs), FAKE_MODE="ok", FAKE_DELAY="0")
+        self.accounts = self.root / "accounts"
+        os.environ.update(FAKE_LOG_DIR=str(self.logs), FAKE_MODE="ok", FAKE_DELAY="0",
+                          CODEX_IMAGE_ACCOUNTS_DIR=str(self.accounts))
+        accounts._EXHAUSTED.clear()
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def calls(self):
-        return [json.loads(p.read_text()) for p in sorted(self.logs.glob("*.json"))]
+        return [json.loads(p.read_text()) for p in sorted(self.logs.glob("thread-*.json"))]
 
     def gen(self, out, **kw):
         return core.generate("pixel miner", str(out), codex_bin=FAKE, codex_home=str(self.home), **kw)

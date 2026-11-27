@@ -52,8 +52,12 @@ Any other MCP client (stdio):
 | `generate_images` | Several jobs in parallel (`concurrency`, default 3), for example every pose of a sprite set. One result per job, in order. |
 | `edit_image` | Changes only a region (`box` or `mask_path`) of an existing image. Everything outside it stays pixel-identical. |
 | `normalize_frames` | Makes generated frames one consistent set: same body size, feet baseline and palette as a reference. Local and instant. |
-| `login_status` | Whether Codex is signed in, and the plan (`plus`, `pro`...). |
-| `start_device_login` | Starts `codex login --device-auth` and returns the URL and one-time code. |
+| `login_status` | Whether an account is signed in, with its email and plan (`plus`, `pro`...). |
+| `start_device_login` | Signs an account in with a device code (`account`, default `"default"`); returns the URL and one-time code. |
+| `list_accounts` | The signed-in accounts, with email and plan. |
+| `account_usage` | Each account's 5-hour and weekly usage, when it resets, and its rate-limit reset credits. |
+| `use_rate_limit_reset` | Redeems one reset credit of an account, which restarts its usage windows. |
+| `remove_account` | Signs out and deletes an added account. |
 
 Shared options:
 
@@ -126,6 +130,28 @@ positions, with slightly different colours. `normalize_frames` fixes that determ
   "output_dir": "/abs/path/assets/miner_combat"
 }
 ```
+
+## Several accounts and reset credits
+
+Every ChatGPT account has its own Codex usage limits. Add more accounts and the server
+spreads work across them:
+
+1. `start_device_login` with a new name, e.g. `{"account": "alt1"}`. Each added account gets
+   its own Codex home under `~/.local/share/codex-image-mcp/accounts/<name>/`
+   (`CODEX_IMAGE_ACCOUNTS_DIR` to move it) holding only that login. `"default"` is your own
+   `~/.codex` login.
+2. Generate as usual. With `account` unset, the default account is tried first; an account
+   that hits its usage limit is skipped until it resets and the job runs on the next one.
+   Each result names the `account` used. Pass `account` to pin one.
+3. When every account is limited, the job fails with an error that says so. `account_usage`
+   shows when each account resets and the reset credits it has earned (Codex grants
+   occasional "Full reset (Weekly + 5 hr)" credits). `use_rate_limit_reset` redeems one,
+   the one that expires first unless you pass `credit_id`.
+
+Resetting is irreversible, so `use_rate_limit_reset` refuses while the account still has
+usage left unless you pass `force: true`. Usage and resets go through the official
+`codex app-server` (`account/rateLimits/read`, `account/rateLimitResetCredit/consume`);
+tokens never leave Codex.
 
 ## Cost and speed
 
