@@ -6,7 +6,6 @@ chroma background, trims and downscales it, and writes it where asked.
 """
 from __future__ import annotations
 
-import base64
 import json
 import os
 import re
@@ -21,6 +20,8 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+
+from . import accounts
 
 DEFAULT_TIMEOUT = 600
 DEFAULT_TOLERANCE = 60
@@ -40,6 +41,10 @@ When the image is generated, reply only with DONE."""
 
 class CodexImageError(RuntimeError):
     """Raised when Codex cannot produce the requested image."""
+
+
+class UsageLimitError(CodexImageError):
+    """Raised when the account that ran Codex has hit its plan's usage limit."""
 
 
 def resolve_home(override: str | None = None) -> Path:
@@ -191,19 +196,56 @@ def postprocess(path: Path, chroma_key: str | None = None, tolerance: int = DEFA
 
 def _run_codex(text: str, refs: list[Path], timeout: int, reasoning_effort: str,
                codex_bin: str | None, codex_home: str | None,
-               lean_context: bool = True) -> tuple[list[Path], str, dict]:
-    """Run one headless Codex turn and return the images it saved, oldest first.
+               lean_context: bool = True,
+               account: str | None = None) -> tuple[list[Path], str, dict, str]:
+    """Run one headless Codex turn on an account and return the images it saved, oldest
+    first, plus the account that ran it.
 
-    With lean_context, Codex runs in a home of its own that shares only the login, so the
-    user's AGENTS.md, skills and memories never enter the prompt (about 19k fewer tokens)."""
-    real_home = resolve_home(codex_home)
-    lean = _prepare_lean_home(real_home) if lean_context else None
+    With no account, every signed-in account that has not hit its usage limit is tried in
+    turn (the default first); an account that hits its limit is skipped until it resets."""
+    try:
+        names = accounts.candidates(account)
+    except accounts.AccountError as e:
+        raise CodexImageError(str(e)) from e
+    limited = []
+    for name in names:
+        try:
+            return (*_run_codex_on(text, refs, timeout, reasoning_effort, codex_bin,
+                                   codex_home, lean_context, name), name)
+        except UsageLimitError as e:
+            accounts.mark_exhausted(name)
+            limited.append(f"{name}: {e}")
+    raise UsageLimitError(_limits_hint(limited, account))
+
+
+def _limits_hint(limited: list[str], account: str | None) -> str:
+    who = f"account {account!r}" if account else "every signed-in account"
+    tried = ("; ".join(limited)) if limited else "all accounts were already marked as limited"
+    return (f"{who} has hit its Codex usage limit ({tried}). Call account_usage to see when "
+            "each account resets and how many reset credits it has; use_rate_limit_reset "
+            "redeems one, and start_device_login with a new account name adds another account.")
+
+
+def _run_codex_on(text: str, refs: list[Path], timeout: int, reasoning_effort: str,
+                  codex_bin: str | None, codex_home: str | None, lean_context: bool,
+                  account: str) -> tuple[list[Path], str, dict]:
+    """Run one headless Codex turn in an account's home.
+
+    For the default account, lean_context runs Codex in a home of its own that shares only
+    the login, so the user's AGENTS.md, skills and memories never enter the prompt (about
+    19k fewer tokens). Added accounts' homes hold only their login, so they are lean already."""
+    if account != accounts.DEFAULT:
+        real_home, lean = accounts.account_home(account), None
+    else:
+        real_home = resolve_home(codex_home)
+        lean = _prepare_lean_home(real_home) if lean_context else None
     home = lean or real_home
     cmd = [resolve_bin(codex_bin), "exec", "--skip-git-repo-check", "--ignore-rules",
            "--ignore-user-config", "-s", "read-only", "--json",
            "-c", f'model_reasoning_effort="{reasoning_effort}"']
     for feature in DISABLED_FEATURES:
         cmd += ["--disable", feature]
+    cmd += accounts.file_store_args(account)
     for ref in refs:
         cmd += ["-i", str(ref)]
     cmd.append("-")  # prompt on stdin, so -i cannot swallow it
@@ -244,6 +286,8 @@ def _run_codex(text: str, refs: list[Path], timeout: int, reasoning_effort: str,
                     key=lambda p: p.stat().st_mtime) if thread_id else []
     if not images:
         detail = "; ".join(errors) or (replies[-1] if replies else run.stderr.strip()[-500:])
+        if any(accounts.is_usage_limit(e) for e in errors):
+            raise UsageLimitError(detail)
         raise CodexImageError(f"Codex finished without generating an image: {detail}")
     return images, thread_id, usage
 
@@ -262,6 +306,7 @@ def generate(
     lean_context: bool = True,
     codex_bin: str | None = None,
     codex_home: str | None = None,
+    account: str | None = None,
 ) -> dict:
     out = Path(output_path).expanduser().resolve()
     if out.suffix.lower() != ".png":
@@ -280,8 +325,8 @@ def generate(
     ref_note = ("The attached image(s) are references; follow them for character design, "
                 "palette and style.\n") if refs else ""
     text = PROMPT_TEMPLATE.format(refs=ref_note, prompt=prompt.strip())
-    images, thread_id, usage = _run_codex(text, refs, timeout, reasoning_effort, codex_bin, codex_home,
-                                          lean_context)
+    images, thread_id, usage, used = _run_codex(text, refs, timeout, reasoning_effort, codex_bin,
+                                                codex_home, lean_context, account)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(images[-1], out)
@@ -290,7 +335,8 @@ def generate(
     with Image.open(out) as img:
         width, height = img.size
     return {"path": str(out), "width": width, "height": height, "thread_id": thread_id,
-            "raw_path": str(images[-1]), "images_generated": len(images), "usage": usage}
+            "raw_path": str(images[-1]), "images_generated": len(images), "usage": usage,
+            "account": used}
 
 
 EDIT_PROMPT = """Edit the first attached image with your built-in image generation tool and output exactly one image.
@@ -414,6 +460,7 @@ def edit(
     lean_context: bool = True,
     codex_bin: str | None = None,
     codex_home: str | None = None,
+    account: str | None = None,
 ) -> dict:
     """Edit only a region of an image; every pixel outside it stays identical to the original.
 
@@ -446,8 +493,9 @@ def edit(
         flat.resize((w * k, h * k), Image.Resampling.NEAREST).save(ref)
         Image.fromarray((region * 255).astype(np.uint8)).resize(
             (w * k, h * k), Image.Resampling.NEAREST).save(mask_ref)
-        images, thread_id, usage = _run_codex(text, [ref, mask_ref], timeout, reasoning_effort,
-                                              codex_bin, codex_home, lean_context)
+        images, thread_id, usage, used = _run_codex(text, [ref, mask_ref], timeout,
+                                                    reasoning_effort, codex_bin, codex_home,
+                                                    lean_context, account)
 
     with Image.open(images[-1]) as gi:
         gen = np.asarray(gi.convert("RGB"), dtype=np.float32)
@@ -472,6 +520,7 @@ def edit(
     Image.fromarray(result, "RGBA").save(out)
     report = {"path": str(out), "width": w, "height": h, "thread_id": thread_id,
               "raw_path": str(images[-1]), "pixels_changed": int(take.sum()), "usage": usage,
+              "account": used,
               "alignment": {"scale": round(float(1 / f), 3),
                             "origin": [round(float(-dx / f), 1), round(float(-dy / f), 1)],
                             "error": round(float(err), 1)}}
@@ -652,8 +701,12 @@ def generate_batch(jobs: list[dict], concurrency: int = 3, **shared) -> list[dic
         return list(pool.map(run, jobs))
 
 
-def login_status(codex_bin: str | None = None, codex_home: str | None = None) -> dict:
-    home = resolve_home(codex_home)
+def login_status(codex_bin: str | None = None, codex_home: str | None = None,
+                 account: str = accounts.DEFAULT) -> dict:
+    try:
+        home = accounts.account_home(account, codex_home)
+    except accounts.AccountError as e:
+        raise CodexImageError(str(e)) from e
     env = dict(os.environ, CODEX_HOME=str(home))
     try:
         run = subprocess.run([resolve_bin(codex_bin), "login", "status"],
@@ -661,15 +714,9 @@ def login_status(codex_bin: str | None = None, codex_home: str | None = None) ->
         status = (run.stdout + run.stderr).strip()
     except FileNotFoundError:
         status = "codex CLI not found"
-    plan = None
-    try:
-        token = json.loads((home / "auth.json").read_text())["tokens"]["id_token"]
-        part = token.split(".")[1]
-        claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
-        plan = claims.get("https://api.openai.com/auth", {}).get("chatgpt_plan_type")
-    except (OSError, KeyError, ValueError, IndexError):
-        pass
-    return {"status": status, "plan": plan}
+    claims = accounts.token_claims(home)
+    return {"account": account, "status": status, "plan": claims.get("plan"),
+            "email": claims.get("email")}
 
 
 _login_proc: subprocess.Popen | None = None
@@ -677,15 +724,26 @@ URL_RE = re.compile(r"https://\S+")
 CODE_RE = re.compile(r"\b[A-Z0-9]{4,}-[A-Z0-9]{4,}\b")
 
 
-def start_device_login(codex_bin: str | None = None, wait_seconds: int = 30) -> dict:
-    """Start `codex login --device-auth` and return its URL and one-time code.
+def start_device_login(codex_bin: str | None = None, wait_seconds: int = 30,
+                       account: str = accounts.DEFAULT, codex_home: str | None = None) -> dict:
+    """Start `codex login --device-auth` for an account and return its URL and one-time code.
 
+    A new account name creates that account's own Codex home. Its login is kept in a plain
+    auth.json there, so several accounts never share one keyring entry.
     The process keeps running in the background until the user approves the code.
     """
     global _login_proc
+    try:
+        home = accounts.account_home(account, codex_home)
+    except accounts.AccountError as e:
+        raise CodexImageError(str(e)) from e
+    cmd = [resolve_bin(codex_bin), "login", "--device-auth"]
+    if account != accounts.DEFAULT:
+        home.mkdir(parents=True, exist_ok=True, mode=0o700)
+        cmd += accounts.file_store_args(account)
     cancel_device_login()
-    _login_proc = subprocess.Popen([resolve_bin(codex_bin), "login", "--device-auth"],
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    _login_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, env=dict(os.environ, CODEX_HOME=str(home)))
     lines: list[str] = []
     found: dict = {}
 
@@ -706,7 +764,7 @@ def start_device_login(codex_bin: str | None = None, wait_seconds: int = 30) -> 
         time.sleep(0.1)
     if not ("url" in found and "code" in found):
         raise CodexImageError("codex did not print a device code: " + "".join(lines)[-500:])
-    return {"url": found["url"], "code": found["code"]}
+    return {"account": account, "url": found["url"], "code": found["code"]}
 
 
 def cancel_device_login() -> None:
