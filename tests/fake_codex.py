@@ -60,9 +60,10 @@ if refresh == "inplace":
     with open(auth_path, "w") as f:
         f.write('{"tokens": "refreshed-inplace"}')
 elif refresh == "rename":
-    with open(auth_path + ".tmp", "w") as f:
+    tmp = f"{auth_path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
         f.write('{"tokens": "refreshed-rename"}')
-    os.replace(auth_path + ".tmp", auth_path)
+    os.replace(tmp, auth_path)
 if mode == "fail":
     print(json.dumps({"type": "turn.failed", "error": {"message": "usage limit reached"}}))
     sys.exit(1)
